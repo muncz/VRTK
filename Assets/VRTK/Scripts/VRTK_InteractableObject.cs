@@ -95,6 +95,19 @@ namespace VRTK
             Drop_ValidSnapDropZone
         }
 
+        /// <summary>
+        /// The types of actions the secondary controller will have on the object on a secondary grab attempt
+        /// </summary>
+        /// <param name="No_Action">Nothing will happen to the grabbed object if a secondary controller attempts to grab it.</param>
+        /// <param name="Swap_Controller">The object will be swapped after another grab attempt to the secondary grabbing controller.</param>
+        /// <param name="Control_Direction">The object's direction/rotation will be influenced by the position of the secondary grabbing controller.</param>
+        public enum SecondaryControllerActions
+        {
+            No_Action,
+            Swap_Controller,
+            Control_Direction
+        }
+
         [Header("Touch Interactions", order = 1)]
 
         [Tooltip("The object will only highlight when a controller touches it if this is checked.")]
@@ -114,8 +127,8 @@ namespace VRTK
         public bool isGrabbable = false;
         [Tooltip("Determines in what situation the object can be dropped by the controller grab button.")]
         public ValidDropTypes validDrop = ValidDropTypes.Drop_Anywhere;
-        [Tooltip("Determines if the object can be swapped between controllers when it is picked up. If it is unchecked then the object must be dropped before it can be picked up by the other controller.")]
-        public bool isSwappable = true;
+        [Tooltip("Determines what should happen to the object if another grab attempt is made by a secondary controller if the object is already being grabbed.")]
+        public SecondaryControllerActions secondaryGrabAction = SecondaryControllerActions.Swap_Controller;
         [Tooltip("If this is checked then the grab button on the controller needs to be continually held down to keep grabbing. If this is unchecked the grab button toggles the grab action with one button press to grab and another to release.")]
         public bool holdButtonToGrab = true;
         [Tooltip("If this is set to `Undefined` then the global grab alias button will grab the object, setting it to any other button will ensure the override button is used to grab this specific interactable object.")]
@@ -203,12 +216,13 @@ namespace VRTK
         protected Rigidbody rb;
         protected bool autoRigidbody = false;
         protected List<GameObject> touchingObjects = new List<GameObject>();
-        protected GameObject grabbingObject = null;
+        protected List<GameObject> grabbingObjects = new List<GameObject>();
         protected GameObject usingObject = null;
         protected Transform grabbedSnapHandle;
         protected Transform trackPoint;
         protected bool customTrackPoint = false;
         protected Transform originalControllerAttachPoint;
+        protected Transform secondaryControllerAttachPoint;
         protected Transform previousParent;
         protected bool previousKinematicState;
         protected bool previousIsGrabbable;
@@ -310,11 +324,11 @@ namespace VRTK
         /// <returns>Returns `true` if the object is currently being grabbed.</returns>
         public bool IsGrabbed(GameObject grabbedBy = null)
         {
-            if (grabbingObject && grabbedBy != null)
+            if (grabbingObjects.Count > 0 && grabbedBy != null)
             {
-                return (grabbingObject == grabbedBy);
+                return (grabbingObjects.Contains(grabbedBy));
             }
-            return (grabbingObject != null);
+            return (grabbingObjects.Count > 0);
         }
 
         /// <summary>
@@ -364,20 +378,15 @@ namespace VRTK
         /// <param name="currentGrabbingObject">The game object that is currently grabbing this object.</param>
         public virtual void Grabbed(GameObject currentGrabbingObject)
         {
-            if (snappedInSnapDropZone)
+            if (!IsGrabbed() || IsSwappable())
             {
-                ToggleSnapDropZone(storedSnapDropZone, false);
+                PrimaryControllerGrab(currentGrabbingObject);
+            }
+            else
+            {
+                SecondaryControllerGrab(currentGrabbingObject);
             }
             OnInteractableObjectGrabbed(SetInteractableObjectEvent(currentGrabbingObject));
-            ForceReleaseGrab();
-            RemoveTrackPoint();
-            grabbingObject = currentGrabbingObject;
-            SetTrackPoint(grabbingObject);
-            if (!isSwappable)
-            {
-                previousIsGrabbable = isGrabbable;
-                isGrabbable = false;
-            }
         }
 
         /// <summary>
@@ -386,12 +395,15 @@ namespace VRTK
         /// <param name="previousGrabbingObject">The game object that was previously grabbing this object.</param>
         public virtual void Ungrabbed(GameObject previousGrabbingObject)
         {
-            RemoveTrackPoint();
-            ResetUseState(previousGrabbingObject);
+            if (GetSecondaryGrabbingObject() == null)
+            {
+                PrimaryControllerUngrab(previousGrabbingObject);
+            }
+            else
+            {
+                SecondaryControllerUngrab(previousGrabbingObject);
+            }
             OnInteractableObjectUngrabbed(SetInteractableObjectEvent(previousGrabbingObject));
-            grabbedSnapHandle = null;
-            grabbingObject = null;
-            LoadPreviousState();
         }
 
         /// <summary>
@@ -532,7 +544,7 @@ namespace VRTK
         /// </summary>
         public void SaveCurrentState()
         {
-            if (grabbingObject == null && !snappedInSnapDropZone)
+            if (!IsGrabbed() && !snappedInSnapDropZone)
             {
                 previousParent = transform.parent;
 
@@ -583,7 +595,16 @@ namespace VRTK
         /// <returns>The game object of what is grabbing the current object.</returns>
         public GameObject GetGrabbingObject()
         {
-            return grabbingObject;
+            return (IsGrabbed() ? grabbingObjects[0] : null);
+        }
+
+        /// <summary>
+        /// The GetSecondaryGrabbingObject method is used to return the game object that is currently being used to influence this object whilst it is being grabbed by a secondary controller.
+        /// </summary>
+        /// <returns>The game object of the secondary controller influencing the current grabbed object.</returns>
+        public GameObject GetSecondaryGrabbingObject()
+        {
+            return (grabbingObjects.Count > 1 ? grabbingObjects[1] : null);
         }
 
         /// <summary>
@@ -701,9 +722,9 @@ namespace VRTK
         }
 
         /// <summary>
-        /// The IsDroppable method returns whether the item can be dropped or not in it's current situation.
+        /// The IsDroppable method returns whether the object can be dropped or not in it's current situation.
         /// </summary>
-        /// <returns>Returns true if the item can currently be dropped and returns false if it is not currently possible to drop.</returns>
+        /// <returns>Returns true if the object can currently be dropped and returns false if it is not currently possible to drop.</returns>
         public bool IsDroppable()
         {
             switch (validDrop)
@@ -716,6 +737,24 @@ namespace VRTK
                     return hoveredOverSnapDropZone;
             }
             return false;
+        }
+
+        /// <summary>
+        /// The IsSwappable method returns whether the object can be grabbed with one controller and then swapped to another controller by grabbing with the secondary controller.
+        /// </summary>
+        /// <returns>Returns true if the object can be grabbed by a secondary controller whilst already being grabbed and the object will swap controllers. Returns false if the object cannot be swapped.</returns>
+        public bool IsSwappable()
+        {
+            return (secondaryGrabAction == SecondaryControllerActions.Swap_Controller ? true : false);
+        }
+
+        /// <summary>
+        /// The PerformSecondaryAction method returns whether the object has a secondary action that can be performed when grabbing the object with a secondary controller.
+        /// </summary>
+        /// <returns>Returns true if the obejct has a secondary action, returns false if it has no secondary action or is swappable.</returns>
+        public bool PerformSecondaryAction()
+        {
+            return (!GetSecondaryGrabbingObject() && secondaryGrabAction == SecondaryControllerActions.Control_Direction ? true : false);
         }
 
         protected virtual void Awake()
@@ -742,10 +781,7 @@ namespace VRTK
 
         protected virtual void Update()
         {
-            if (AttachIsTrackObject())
-            {
-                CheckBreakDistance();
-            }
+            CheckBreakDistance();
         }
 
         protected virtual void FixedUpdate()
@@ -762,6 +798,8 @@ namespace VRTK
                         break;
                 }
             }
+
+            FixedUpdateApplySecondaryAction();
         }
 
         protected virtual void OnEnable()
@@ -807,7 +845,7 @@ namespace VRTK
             {
                 rb.isKinematic = previousKinematicState;
             }
-            if (!isSwappable)
+            if (!IsSwappable())
             {
                 isGrabbable = previousIsGrabbable;
             }
@@ -828,8 +866,58 @@ namespace VRTK
             }
         }
 
+        private void PrimaryControllerGrab(GameObject currentGrabbingObject)
+        {
+            if (snappedInSnapDropZone)
+            {
+                ToggleSnapDropZone(storedSnapDropZone, false);
+            }
+            ForceReleaseGrab();
+            RemoveTrackPoint();
+            grabbingObjects.Add(currentGrabbingObject);
+            SetTrackPoint(currentGrabbingObject);
+            if (!IsSwappable())
+            {
+                previousIsGrabbable = isGrabbable;
+                isGrabbable = false;
+            }
+        }
+
+        private void SecondaryControllerGrab(GameObject currentGrabbingObject)
+        {
+            if (!grabbingObjects.Contains(currentGrabbingObject))
+            {
+                grabbingObjects.Add(currentGrabbingObject);
+
+                secondaryControllerAttachPoint = new GameObject(string.Format("[{0}]Secondary_Controller_AttachPoint", currentGrabbingObject.name)).transform;
+                secondaryControllerAttachPoint.parent = transform;
+                secondaryControllerAttachPoint.position = currentGrabbingObject.transform.position;
+                secondaryControllerAttachPoint.rotation = currentGrabbingObject.transform.rotation;
+            }
+        }
+
+        private void PrimaryControllerUngrab(GameObject previousGrabbingObject)
+        {
+            RemoveTrackPoint();
+            ResetUseState(previousGrabbingObject);
+            grabbedSnapHandle = null;
+            grabbingObjects.Clear();
+            LoadPreviousState();
+        }
+
+        private void SecondaryControllerUngrab(GameObject previousGrabbingObject)
+        {
+            if (grabbingObjects.Contains(previousGrabbingObject))
+            {
+                grabbingObjects.Remove(previousGrabbingObject);
+                Destroy(secondaryControllerAttachPoint.gameObject);
+                secondaryControllerAttachPoint = null;
+            }
+        }
+
         private void ForceReleaseGrab()
         {
+            var grabbingObject = GetGrabbingObject();
             if (grabbingObject)
             {
                 grabbingObject.GetComponent<VRTK_InteractGrab>().ForceRelease();
@@ -846,7 +934,7 @@ namespace VRTK
 
         private void CheckBreakDistance()
         {
-            if (trackPoint && IsDroppable())
+            if (AttachIsTrackObject() && trackPoint && IsDroppable())
             {
                 float distance = Vector3.Distance(trackPoint.position, originalControllerAttachPoint.position);
                 if (distance > (detachThreshold / 1000))
@@ -888,7 +976,7 @@ namespace VRTK
                 customTrackPoint = false;
             }
 
-            originalControllerAttachPoint = new GameObject(string.Format("[{0}]Original_Controller_AttachPoint", grabbingObject.name)).transform;
+            originalControllerAttachPoint = new GameObject(string.Format("[{0}]Original_Controller_AttachPoint", GetGrabbingObject().name)).transform;
             originalControllerAttachPoint.parent = transform;
             originalControllerAttachPoint.position = trackPoint.position;
             originalControllerAttachPoint.rotation = trackPoint.rotation;
@@ -951,6 +1039,56 @@ namespace VRTK
             rb.velocity = Vector3.MoveTowards(rb.velocity, velocityTarget, maxDistanceDelta);
         }
 
+        private void FixedUpdateApplySecondaryAction()
+        {
+            var primaryGrabbingObject = GetGrabbingObject();
+            var secondaryGrabbingObject = GetSecondaryGrabbingObject();
+            if (primaryGrabbingObject && secondaryGrabbingObject)
+            {
+                switch (secondaryGrabAction)
+                {
+                    case SecondaryControllerActions.Control_Direction:
+                        FixedUpdateSecondaryControlDirection(primaryGrabbingObject.GetComponent<VRTK_InteractGrab>(), secondaryGrabbingObject.GetComponent<VRTK_InteractGrab>());
+                        break;
+                }
+            }
+        }
+
+        private void FixedUpdateSecondaryControlDirection(VRTK_InteractGrab primaryGrabbingObject, VRTK_InteractGrab secondaryGrabbingObject)
+        {
+            /*
+            var projectedVector = (Vector3.Normalize(secondaryGrabbingObject.controllerAttachPoint.transform.position - primaryGrabbingObject.controllerAttachPoint.transform.position)) + primaryGrabbingObject.controllerAttachPoint.transform.position;
+            transform.LookAt(projectedVector);
+            transform.Translate(primaryGrabbingObject.controllerAttachPoint.transform.position - originalControllerAttachPoint.position, Space.World);*/
+
+            //Vector3 controllerForward = primaryGrabbingObject.controllerAttachPoint.transform.forward;
+            //Vector3 projectedVector = Vector3.Normalize(secondaryGrabbingObject.controllerAttachPoint.transform.position - primaryGrabbingObject.controllerAttachPoint.transform.position);
+            //Quaternion newRotation = Quaternion.FromToRotation(controllerForward, projectedVector);
+            //transform.rotation = newRotation * originalRotation;
+
+            //transform.rotation = Quaternion.LookRotation(secondaryGrabbingObject.transform.position - primaryGrabbingObject.controllerAttachPoint.transform.position, secondaryGrabbingObject.transform.TransformDirection(-Vector3.left));
+
+            //TrackControllers(originalControllerAttachPoint, secondaryControllerAttachPoint.transform, primaryGrabbingObject, secondaryGrabbingObject);
+        }
+
+        void TrackControllers(Transform g1, Transform g2, Transform c1, Transform c2)
+        {
+            MatchRotation(g1, g2, c1, c2);
+            MatchPosition(g1, c1);
+        }
+
+        void MatchRotation(Transform g1, Transform g2, Transform c1, Transform c2)
+        {
+            var desiredOrientation = c2.position - c1.position;
+            var currentOrientation = g2.position - g1.position;
+            transform.rotation *= Quaternion.FromToRotation(currentOrientation, desiredOrientation);
+        }
+
+        void MatchPosition(Transform g1, Transform c1)
+        {
+            transform.Translate(c1.position - g1.position, Space.World);
+        }
+
         private void OnTeleporting(object sender, DestinationMarkerEventArgs e)
         {
             if (!stayGrabbedOnTeleport)
@@ -964,7 +1102,7 @@ namespace VRTK
         {
             if (stayGrabbedOnTeleport && AttachIsTrackObject() && trackPoint)
             {
-                transform.position = grabbingObject.transform.position;
+                transform.position = GetGrabbingObject().transform.position;
             }
         }
 
@@ -1013,6 +1151,8 @@ namespace VRTK
                     forcedDropped = true;
                 }
             }
+
+            var grabbingObject = GetGrabbingObject();
 
             if (grabbingObject != null && (grabbingObject.activeInHierarchy || forceDisabled))
             {
